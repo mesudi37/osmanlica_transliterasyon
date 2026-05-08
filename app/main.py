@@ -64,7 +64,7 @@ app = FastAPI(
         "using morphological analysis (Zeyrek), rule-based allomorph generation, "
         "and English loanword transliteration."
     ),
-    version="2.0.0",
+    version="2.0.1",
     lifespan=lifespan,
 )
 
