@@ -27,7 +27,7 @@ Sunucu hazır olduğunda **http://localhost:8000/docs** adresinden Swagger UI a�
 Sunucu sağlık kontrolü.
 
 ```json
-{ "status": "ok", "engine": "OttomanTransliterator", "version": "2.0.0" }
+{ "status": "ok", "engine": "OttomanTransliterator", "version": "2.0.1" }
 ```
 
 ---
