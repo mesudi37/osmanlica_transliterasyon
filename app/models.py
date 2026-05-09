@@ -51,4 +51,4 @@ class BatchResponse(BaseModel):
 class HealthResponse(BaseModel):
     status:  str = "ok"
     engine:  str = "OttomanTransliterator"
-    version: str = "2.0.3"
+    version: str = "2.0.4"
