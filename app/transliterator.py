@@ -1,35 +1,31 @@
 """
-Ottoman Turkish Transliterator
-================================
-Self-contained engine that converts Modern Turkish text into Ottoman
-Arabic-script (حروف عثمانیه).  No Jupyter / IPython dependencies.
-
+Ottoman Turkish Transliterator  v2.0.3
+======================================
 Synced from: Claude_2may_koklu_corpus_maker_improved.ipynb
+API-only changes kept:
+  - punkt bypass patch
+  - module-level LRU cache (instance lru_cache doesn't persist)
+  - skip_first fix in render_ottoman (prevents double-alef)
+  - OttomanTransliterator class wrapper
+  - "auto" fallback instead of "[token]" brackets
 """
-
 from __future__ import annotations
-
-import csv
-import logging
-import os
-import re
+import csv, logging, os, re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Optional
 
 import zeyrek
-
-# ── Bypass nltk punkt_tab (Zeyrek tokenises single words; punkt unused) ──────
 import zeyrek.morphology as _zm
+
+# ── Bypass nltk punkt_tab (single tokens only, punkt unused) ─────────────────
 def _simple_tokenize(text: str) -> list[str]:
     return [text.strip()] if text.strip() else []
 _zm._tokenize_text = _simple_tokenize
-
 logging.getLogger("zeyrek").setLevel(logging.ERROR)
 
-# ── Module-level analyzer + LRU cache (instance lru_cache doesn't persist) ───
+# ── Module-level analyzer + LRU cache ────────────────────────────────────────
 _module_analyzer: Optional[zeyrek.MorphAnalyzer] = None
-
 def _get_module_analyzer() -> zeyrek.MorphAnalyzer:
     global _module_analyzer
     if _module_analyzer is None:
@@ -40,15 +36,12 @@ def _get_module_analyzer() -> zeyrek.MorphAnalyzer:
 def _cached_zeyrek_analyze(word: str):
     return list(_get_module_analyzer().analyze(word))
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # §1  CONFIGURATION
-# ============================================================
-
+# ══════════════════════════════════════════════════════════════════════════════
 SCORE_MAP: dict[str, float] = {
-    "exact":   1.0, "override": 1.0, "tags": 1.0, "punct": 1.0,
-    "english": 0.7,
-    "auto":    0.6,
-    # "missing" artık kullanılmıyor; bilinmeyen tokenlar "auto" olarak işlenir
+    "exact": 1.0, "override": 1.0, "surface": 1.0, "tags": 1.0, "punct": 1.0,
+    "english": 0.7, "auto": 0.6,
 }
 
 KALIN_UNLULER    = set("aıou")
@@ -64,25 +57,20 @@ PHONEME_MAP: dict[str, str] = {
     "y":"ی","z":"ز","k":"ک","q":"ق",
 }
 PUNCTUATION_MAP: dict[str, str] = {",":"،",";":"؛","?":"؟","%":"٪"}
-
 TR_LOWER_MAP     = str.maketrans("IİÇĞÖŞÜ","ıiçğöşü")
-TR_NORMALIZE_MAP = str.maketrans("ÂâÎîÛû", "AaİiUu")
+TR_NORMALIZE_MAP = str.maketrans("ÂâÎîÛû","AaİiUu")
 
 _TR_WORD_CHARS = r"a-zA-Z0-9_ğüşıöçâîûÂÎÛĞÜŞİÖÇ"
 _TR_WORD       = f"[{_TR_WORD_CHARS}]"
-_TOKEN_RE      = re.compile(
-    rf"{_TR_WORD}+(?:[\u2018\u2019']{_TR_WORD}+)?|[^\s{_TR_WORD_CHARS}]+"
-)
-_WORD_TOKEN_RE = re.compile(
-    rf"^{_TR_WORD}+(?:[\u2018\u2019']{_TR_WORD}+)?$"
-)
+_TOKEN_RE      = re.compile(rf"{_TR_WORD}+(?:[\u2018\u2019']{_TR_WORD}+)?|[^\s{_TR_WORD_CHARS}]+")
+_WORD_TOKEN_RE = re.compile(rf"^{_TR_WORD}+(?:[\u2018\u2019']{_TR_WORD}+)?$")
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # §2  FSM STATES
-# ============================================================
-ROOT = "ROOT"; DERIVATION = "DERIVATION"; DERIVATION_NOMINAL = "DERIVATION_NOMINAL"
-VOICE = "VOICE"; NEGATION = "NEGATION"; TENSE_ST = "TENSE"; PERSON_ST = "PERSON"
-CASE_ST = "CASE"; PLURAL_ST = "PLURAL"; POSSESSIVE_ST = "POSSESSIVE"; COPULA_ST = "COPULA"
+# ══════════════════════════════════════════════════════════════════════════════
+ROOT="ROOT"; DERIVATION="DERIVATION"; DERIVATION_NOMINAL="DERIVATION_NOMINAL"
+VOICE="VOICE"; NEGATION="NEGATION"; TENSE_ST="TENSE"; PERSON_ST="PERSON"
+CASE_ST="CASE"; PLURAL_ST="PLURAL"; POSSESSIVE_ST="POSSESSIVE"; COPULA_ST="COPULA"
 
 ROOT_POS_TAGS   = {"NOUN","VERB","ADJ","ADV","PRON","NUM","QUES"}
 EMPTY_TAGS      = {"NOM","A3SG"}
@@ -91,8 +79,8 @@ POSSESSIVE_TAGS = {"P1SG","P2SG","P3SG","P1PL","P2PL","P3PL"}
 CASE_TAGS       = {"NOM","ACC","DAT","LOC","ABL","GEN","INS","REL","REL_LOC"}
 VOICE_TAGS      = {"PASSIVE","CAUSATIVE","RECIPROCAL","REFLEXIVE"}
 VERBAL_DERIVATION_TAGS = {
-    "ABLE","UNABLE","ACQUIRE","INF1","INF2","PART","CONV",
-    "CONV_AFTER","CONV_BY","CONV_SINCE","FUT_PART",
+    "ABLE","UNABLE","ACQUIRE","INF1","INF2","PART","PAST_PART","CONV",
+    "CONV_AFTER","CONV_BY","CONV_SINCE","CONV_ASLONGAS","CONV_WHILE","FUT_PART",
 }
 NOMINAL_DERIVATION_TAGS = {
     "NOM_DER_LIK","NOM_DER_LI","NOM_DER_SIZ",
@@ -100,8 +88,7 @@ NOMINAL_DERIVATION_TAGS = {
 }
 
 TAG_FSM: dict[str,list[str]] = {
-    ROOT:               [DERIVATION,DERIVATION_NOMINAL,VOICE,NEGATION,TENSE_ST,
-                         PERSON_ST,PLURAL_ST,POSSESSIVE_ST,CASE_ST,COPULA_ST],
+    ROOT:               [DERIVATION,DERIVATION_NOMINAL,VOICE,NEGATION,TENSE_ST,PERSON_ST,PLURAL_ST,POSSESSIVE_ST,CASE_ST,COPULA_ST],
     DERIVATION:         [DERIVATION,VOICE,NEGATION,TENSE_ST,PLURAL_ST,POSSESSIVE_ST,CASE_ST],
     DERIVATION_NOMINAL: [DERIVATION_NOMINAL,PLURAL_ST,POSSESSIVE_ST,CASE_ST,COPULA_ST],
     VOICE:              [VOICE,DERIVATION,NEGATION,TENSE_ST,PLURAL_ST,POSSESSIVE_ST,CASE_ST],
@@ -113,12 +100,12 @@ TAG_FSM: dict[str,list[str]] = {
     CASE_ST:            [CASE_ST,PLURAL_ST,COPULA_ST],
     COPULA_ST:          [TENSE_ST,PERSON_ST,CASE_ST],
 }
-
 TAG_TO_STATE: dict[str,str] = {
     "ABLE":DERIVATION,"UNABLE":DERIVATION,"ACQUIRE":DERIVATION,
-    "INF1":DERIVATION,"INF2":DERIVATION,"PART":DERIVATION,
+    "INF1":DERIVATION,"INF2":DERIVATION,"PART":DERIVATION,"PAST_PART":DERIVATION,
     "CONV":DERIVATION,"CONV_AFTER":DERIVATION,"CONV_BY":DERIVATION,
-    "CONV_SINCE":DERIVATION,"FUT_PART":DERIVATION,
+    "CONV_SINCE":DERIVATION,"CONV_ASLONGAS":DERIVATION,"CONV_WHILE":DERIVATION,
+    "FUT_PART":DERIVATION,
     "PASSIVE":VOICE,"CAUSATIVE":VOICE,"RECIPROCAL":VOICE,"REFLEXIVE":VOICE,
     "NEG":NEGATION,
     "PAST":TENSE_ST,"NARR":TENSE_ST,"PROG":TENSE_ST,"PROG2":TENSE_ST,
@@ -137,20 +124,19 @@ TAG_TO_STATE: dict[str,str] = {
     "NOM_DER_MSI":DERIVATION_NOMINAL,
 }
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # §3  BASIC HELPERS
-# ============================================================
-
+# ══════════════════════════════════════════════════════════════════════════════
 def normalize_tr_text(t:str)->str: return t.translate(TR_NORMALIZE_MAP) if t else t
 def lower_tr(t:str)->str: return normalize_tr_text(t).translate(TR_LOWER_MAP).lower() if t else t
 def fold_tr(t:str)->str:
     if not t: return t
     t=lower_tr(t)
     return t.replace("ç","c").replace("ğ","g").replace("ı","i").replace("ö","o").replace("ş","s").replace("ü","u")
-def is_word_token(token:str)->bool: return bool(_WORD_TOKEN_RE.fullmatch(token))
-def convert_ottoman_punctuation(text:str)->str: return "".join(PUNCTUATION_MAP.get(c,c) for c in text)
-def last_vowel(text:str)->str:
-    for ch in reversed(lower_tr(text or "")):
+def is_word_token(t:str)->bool: return bool(_WORD_TOKEN_RE.fullmatch(t))
+def convert_ottoman_punctuation(t:str)->str: return "".join(PUNCTUATION_MAP.get(c,c) for c in t)
+def last_vowel(t:str)->str:
+    for ch in reversed(lower_tr(t or "")):
         if ch in _TUM_UNLULER: return ch
     return "a"
 def is_vowel(ch:str)->bool: return lower_tr(ch or "")[:1] in _TUM_UNLULER
@@ -171,15 +157,15 @@ def strip_infinitive_from_ottoman(w:str)->str:
 def normalize_surface_ascii(t:str)->str:
     t=lower_tr(t); return t.replace("\u2019","'").replace("\u2018","'").replace("'","")
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # §4  MORPHOPHONEMIC REPRESENTATIONS
-# ============================================================
-
+# ══════════════════════════════════════════════════════════════════════════════
 UNDERLYING_MORPHS: dict[str,str] = {
     "PASSIVE":"Il","CAUSATIVE":"DIr","RECIPROCAL":"Iş","REFLEXIVE":"In",
     "ABLE":"(y)Abil","UNABLE":"mA","ACQUIRE":"lAn","NEG":"mA",
-    "INF1":"mAk","INF2":"mA","PART":"","CONV":"",
-    "CONV_AFTER":"Ip","CONV_BY":"(y)ArAk","CONV_SINCE":"(y)AlI",
+    "INF1":"mAk","INF2":"mA","PART":"","PAST_PART":"DIk",
+    "CONV":"","CONV_AFTER":"Ip","CONV_BY":"(y)ArAk",
+    "CONV_SINCE":"(y)AlI","CONV_ASLONGAS":"DIkçA","CONV_WHILE":"ken",
     "PAST":"DI","NARR":"mIş","PROG":"Iyor","PROG2":"mAktA",
     "FUTURE":"(y)AcAk","FUT_PART":"(y)AcAk","AOR":"Ar","COND":"sA","NECES":"mAlI","OPT":"(y)A",
     "A1SG":"Im","A2SG":"sIn","A3SG":"","A1PL":"Iz","A2PL":"sInIz","A3PL":"lAr","PLURAL":"lAr",
@@ -190,7 +176,6 @@ UNDERLYING_MORPHS: dict[str,str] = {
     "NOM_DER_SEL":"sAl","NOM_DER_CI":"CI","NOM_DER_DAS":"DAş","NOM_DER_MSI":"ImsI",
 }
 
-# NB: "ecek" is ەجك (notebook fix, not هجك)
 OTTOMAN_SURFACE_OVERRIDES: dict[str,str] = {
     "lar":"لر","ler":"لر","ları":"لری","leri":"لری",
     "lara":"لره","lere":"لره","lardan":"لردن","lerden":"لردن",
@@ -209,7 +194,8 @@ OTTOMAN_SURFACE_OVERRIDES: dict[str,str] = {
     "sı":"سی","si":"سی","su":"سی","sü":"سی",
     "ı":"ی","i":"ی","u":"ی","ü":"ی",
     "yı":"یی","yi":"یی","yu":"یو","yü":"یو",
-    "a":"ه","e":"ه","ya":"یه","ye":"یه",
+    # Dative — notebook: "a"→"ە", "e"→"ە", "ye"→"یە"
+    "a":"ە","e":"ە","ya":"یه","ye":"یە",
     "da":"ده","de":"ده","ta":"ده","te":"ده",
     "dan":"دن","den":"دن","tan":"دن","ten":"دن",
     "la":"له","le":"له","yla":"یله","yle":"یله",
@@ -236,6 +222,11 @@ OTTOMAN_SURFACE_OVERRIDES: dict[str,str] = {
     "ıl":"یل","il":"یل","ul":"ول","ül":"ول",
     "an":"ان","en":"ان",
     "ıp":"یب","ip":"یب","up":"وب","üp":"وب",
+    # PAST_PART suffixes
+    "dık":"دق","dik":"دك","duk":"دق","dük":"دك",
+    "tık":"دق","tik":"دك","tuk":"دق","tük":"دك",
+    # Agent noun
+    "ıcı":"یجی","ici":"یجی","ucu":"یجی","ücü":"یجی",
     "arak":"ارق","erek":"ارك",
     "lan":"لان","len":"لن",
     "lık":"لق","lik":"لق","luk":"لق","lük":"لق",
@@ -244,16 +235,28 @@ OTTOMAN_SURFACE_OVERRIDES: dict[str,str] = {
     "maman":"مامن","memen":"مەمن",
     "mamak":"مەمق","memek":"مەمك",
     "yalı":"یالی","yeli":"یەلی",
+    "me":"مە",
+    # Optative / prohibitive
+    "yalım":"یالم","yelim":"یەلم","alım":"الم","elim":"الم",
+    "mayın":"مایڭ","meyin":"مەیڭ",
+    # Copula tense
     "iken":"ایکن","yken":"ایکن","ise":"ایسه","ysa":"ایسه","yse":"ایسه",
-    "idi":"ایدی","ydı":"ایدی","ydi":"ایدی","ydu":"ایدی","ydü":"ایدی",
+    "idi":"ایدی",
+    # notebook: ydı/ydi → "یدی" (not "ایدی")
+    "ydı":"یدی","ydi":"یدی","ydu":"یدی","ydü":"یدی",
     "imiş":"ایمش","ymış":"ایمش","ymiş":"ایمش",
     "ydım":"ایدم","ydim":"ایدم","ydın":"ایدڭ","ydin":"ایدڭ",
     "ydık":"ایدق","ydik":"ایدک","ydınız":"ایدڭز","ydiniz":"ایدڭز",
-    "ydılar":"ایدلر","ydiler":"ایدلر",
+    # notebook: ydılar → "یدیلر" (not "ایدلر")
+    "ydılar":"یدیلر","ydiler":"یدیلر",
     "iyordu":"ایوردی","iyormuş":"ایورمش","iyorsa":"ایورسه",
     "ıyordu":"ایوردی","ıyormuş":"ایورمش","ıyorsa":"ایورسه",
     "ndan":"ندن","nden":"ندن","nda":"نده","nde":"نده","na":"نه","ne":"نه",
     "mayalı":"مایالی","meyeli":"میەلی",
+    # CONV_WHILE / CONV_ASLONGAS
+    "ken":"كن",
+    "dıkça":"دقجە","dikçe":"دكجە","dukça":"دقجە","dükçe":"دكجە",
+    "tıkça":"دقجە","tikçe":"دكجە","tukça":"دقجە","tükçe":"دكجە",
 }
 
 VOWEL_DROP_WORDS = {
@@ -261,15 +264,26 @@ VOWEL_DROP_WORDS = {
 }
 
 WORD_OVERRIDES: dict[str,str] = {
-    "Apple":"آپپلە","binalarının":"بنالرینڭ","başka":"باشقە",
+    "Apple":"آپپلە","Almanya'da":"آلمانیەدە",
+    "ağır":"آغير","bağır":"باغر",
+    "binalarının":"بنالرینڭ","başka":"باشقە",
     "çabaladığınız":"چابالادیغڭز",
     "da":"دە","de":"دە","del":"دل",
     "değişikliğe":"دگیشیكلگە","deneyin":"دڭیڭ",
     "için":"ایچون","ile":"ایلە","lise":"لیسه",
-    "Messi":"مسّی","oyunda":"اویوندە","Şikayetinizi":"شكایتیڭزی",
+    "Messi":"مسّی","oyunda":"اویوندە","oynama":"اوينامە",
+    "belirtmek":"بلیرتمك","belirtildi":"بلیرتیلدی",
+    "Şikayetinizi":"شكایتیڭزی",
     "araştırıp":"آراشدیریپ","ar":"آری","azalt":"آزالت",
     "çalışacağız":"چالیشاجغز","çözmeye":"چوزمەیە",
-    "başar":"باشار","bilgilen":"بیلگیلن","kazan":"قزان",
+    "başar":"باشار","bilgilen":"بیلگیلن",
+    "ağlayan":"آغلايان","bulur":"بولور","bulduğum":"بولديغم",
+    "denizdir":"دڭزدر","düş":"دوش","kazan":"قزان",
+    "umutsuzluğa":"اوموتسزلغه",
+    "yaşa":"یاشا","yaşam":"یاشام",
+    "yaşayabilmesinin":"یاشایابیلمەسنڭ","yaşayarak":"یاشایارق",
+    "yaşasaydınız":"یاشاسەیدیڭز","yaşayacaklar":"یاشایاجقلر",
+    "vazgeçmek":"واز گچمك","vazgeç":"واز گچ",
     "tesislerinin":"تأسیسلرینڭ","çatılarına":"چاتیلارینە",
     "eklemeyi":"اكلمەیی","yerleştirilecek":"یرلشدیریلەجك",
     "megavat":"مغه وات","mısınız":"میسڭز",
@@ -278,17 +292,14 @@ WORD_OVERRIDES: dict[str,str] = {
     "elektrik":"الكتریگ","üretecek":"أورتجك",
 }
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # §5  MORPHOPHONEMIC RULES
-# ============================================================
-
+# ══════════════════════════════════════════════════════════════════════════════
 def apply_vowel_harmony(morph:str, root:str)->str:
     return morph.replace("A",choose_harmony_A(root)).replace("I",choose_harmony_I(root))
-
 def apply_vowel_drop(root:str, morph:str)->str:
     if lower_tr(root) not in VOWEL_DROP_WORDS or not morph or not starts_with_vowel(morph): return root
     return root[:-2]+root[-1] if len(root)>=3 else root
-
 def apply_consonant_softening(root:str, morph:str)->str:
     if not morph or not starts_with_vowel(morph): return root
     lr=lower_tr(root)
@@ -296,7 +307,6 @@ def apply_consonant_softening(root:str, morph:str)->str:
     rep={"p":"b","ç":"c","t":"d","k":"ğ"}
     last=lr[-1] if lr else ""
     return root[:-1]+rep[last] if last in rep else root
-
 def apply_buffer_consonants(prev:str, morph:str)->str:
     for tok,char in [("(y)","y"),("(n)","n"),("(s)","s"),("(ş)","ş")]:
         if morph.startswith(tok):
@@ -315,15 +325,16 @@ def resolve_nominal_possessive(tag:str, prev:str)->str:
 
 def resolve_nominal_case(tag:str, prev:str, possessed:bool=False)->str:
     hi,ha,ev=choose_harmony_I(prev),choose_harmony_A(prev),ends_with_vowel(prev)
+    D=choose_initial_D(prev)
     if tag=="NOM":    return ""
-    if tag=="ACC":    return ("n"+hi)    if possessed else (("y" if ev else "")+hi)
-    if tag=="DAT":    return ("n"+ha)    if possessed else (("y" if ev else "")+ha)
-    if tag=="LOC":    return choose_initial_D(prev)+ha
-    if tag=="ABL":    return choose_initial_D(prev)+ha+"n"
+    if tag=="ACC":    return ("n"+hi)           if possessed else (("y" if ev else "")+hi)
+    if tag=="DAT":    return ("n"+ha)           if possessed else (("y" if ev else "")+ha)
+    if tag=="LOC":    return ("n"+D+ha)         if possessed else (D+ha)
+    if tag=="ABL":    return ("n"+D+ha+"n")     if possessed else (D+ha+"n")
     if tag=="GEN":    return (("n" if ev or possessed else "")+hi+"n")
     if tag=="INS":    return ("y" if ev else "")+"l"+ha
     if tag=="REL":    return "ki"
-    if tag=="REL_LOC":return choose_initial_D(prev)+ha+"ki"
+    if tag=="REL_LOC":return D+ha+"ki"
     return ""
 
 def resolve_copula_variant(follow_tag:str, prev:str)->str:
@@ -347,36 +358,40 @@ def fuse_realized_morphs(seq:list[dict])->list[dict]:
         item=dict(seq[i])
         if out:
             prev=out[-1]
-            # NEG absorbs CONV_SINCE / NARR / INF1
             if prev["tag"]=="NEG" and item["tag"] in {"CONV_SINCE","NARR","INF1"}:
                 prev["tag"]=item["tag"]; prev["surface"]+=item["surface"]; i+=1; continue
-            # COND + PAST → ydı/ydi
             if prev["tag"]=="COND" and item["tag"]=="PAST":
                 item["surface"]="y"+choose_initial_D(prev["surface"])+choose_harmony_I(prev["surface"])
-            # COND + person
             if prev["tag"]=="COND" and item["tag"] in {"A1SG","A2SG","A1PL","A2PL"}:
                 hi=choose_harmony_I(prev["surface"])
                 item["surface"]={"A1SG":"m","A2SG":"n","A1PL":"k","A2PL":"n"+hi+"z"}[item["tag"]]
-            # UNABLE + AOR → z
+            # OPT + A1PL → yalım/yelim
+            if prev["tag"]=="OPT" and item["tag"]=="A1PL":
+                prev["surface"]=prev["surface"]+"l"+choose_harmony_I(prev["surface"])+"m"
+                i+=1; continue
             if prev["tag"]=="UNABLE" and item["tag"]=="AOR":
                 item["surface"]="z"
-            # NEG + AOR → maz/mez (absorb)
             if prev["tag"]=="NEG" and item["tag"]=="AOR":
                 prev["tag"]="AOR"; prev["surface"]+="z"; i+=1; continue
-            # NEG + INF2 + P2SG triple fusion
             if (prev["tag"]=="NEG" and item["tag"]=="INF2"
                     and i+1<len(seq) and seq[i+1]["tag"]=="P2SG"):
                 prev["tag"]="INF2"; prev["surface"]+=item["surface"]+seq[i+1]["surface"]; i+=2; continue
-            # FUTURE: acak → acağ before vowel-initial suffix
+            # INF2 + P3SG: drop last char of inf2
+            if prev["tag"]=="INF2" and item["tag"]=="P3SG":
+                prev["surface"]=prev["surface"][:-1]
+            # FUTURE/FUT_PART: acak→acağ before vowel
             if (prev["tag"] in {"FUTURE","FUT_PART"}
                     and item["surface"][:1] in _TUM_UNLULER
                     and prev["surface"].endswith(("acak","ecek","yacak","yecek"))):
                 prev["surface"]=prev["surface"][:-1]+"ğ"
-            # PAST + person endings
+            # PAST_PART: dık→dığ before vowel
+            if (prev["tag"]=="PAST_PART"
+                    and item["surface"][:1] in _TUM_UNLULER
+                    and prev["surface"].endswith(("dık","dik","duk","dük","tık","tik","tuk","tük"))):
+                prev["surface"]=prev["surface"][:-1]+"ğ"
             if prev["tag"]=="PAST" and item["tag"] in {"A1SG","A2SG","A1PL","A2PL"}:
                 hi=choose_harmony_I(prev["surface"])
                 item["surface"]={"A1SG":"m","A2SG":"n","A1PL":"k","A2PL":"n"+hi+"z"}[item["tag"]]
-            # REL + DAT: ki → ye
             if prev["tag"]=="REL" and item["tag"]=="DAT":
                 prev["surface"]=prev["surface"][:-2]+"ye"; i+=1; continue
         out.append(item); i+=1
@@ -395,7 +410,7 @@ def realize_single_morph(
     next_tag:Optional[str]=None,
     copula_mode:bool=False,
     possessed:bool=False,
-) -> Optional[str]:
+)->Optional[str]:
     tag,underlying=morph["tag"],morph["underlying"]
     if tag in POSSESSIVE_TAGS: return resolve_nominal_possessive(tag,prev)
     if tag in CASE_TAGS:       return resolve_nominal_case(tag,prev,possessed=possessed)
@@ -408,23 +423,25 @@ def realize_single_morph(
     if tag=="A3PL":            return "l"+choose_harmony_A(prev)+"r"
     if copula_mode and tag in {"PAST","NARR","COND","NECES"}:
         return resolve_copula_variant(tag,prev)
-    if tag=="PAST":  return choose_initial_D(prev)+choose_harmony_I(prev)
-    if tag=="NARR":  return "m"+choose_harmony_I(prev)+"ş"
-    if tag=="PROG":  return choose_harmony_I(prev)+"yor"
+    if tag=="PAST":   return choose_initial_D(prev)+choose_harmony_I(prev)
+    if tag=="NARR":   return "m"+choose_harmony_I(prev)+"ş"
+    if tag=="PROG":   return choose_harmony_I(prev)+"yor"
     if tag=="PROG2":
         ha=choose_harmony_A(prev); return "m"+ha+"kt"+ha
     if tag in {"FUTURE","FUT_PART"}:
         ha=choose_harmony_A(prev); return ("y" if ends_with_vowel(prev) else "")+ha+"c"+ha+"k"
     if tag=="AOR":
+        ns=normalize_surface_ascii(prev)
+        if ns in {"bul"}: return choose_harmony_I(prev)+"r"
         if lower_tr(prev).endswith(("dır","dir","dur","dür","tır","tir","tur","tür")):
             return choose_harmony_I(prev)+"r"
         if ends_with_vowel(prev): return "r"
         vc=sum(1 for ch in lower_tr(prev) if ch in _TUM_UNLULER)
         return choose_harmony_I(prev)+"r" if vc>1 else choose_harmony_A(prev)+"r"
-    if tag=="COND":  return "s"+choose_harmony_A(prev)
-    if tag=="NECES": return "m"+choose_harmony_A(prev)+"l"+choose_harmony_I(prev)
-    if tag=="OPT":   return ("y" if ends_with_vowel(prev) else "")+choose_harmony_A(prev)
-    if tag=="NEG":   return "m"+choose_harmony_A(prev)
+    if tag=="COND":   return "s"+choose_harmony_A(prev)
+    if tag=="NECES":  return "m"+choose_harmony_A(prev)+"l"+choose_harmony_I(prev)
+    if tag=="OPT":    return ("y" if ends_with_vowel(prev) else "")+choose_harmony_A(prev)
+    if tag=="NEG":    return "m"+choose_harmony_A(prev)
     if tag=="UNABLE":
         ha=choose_harmony_A(prev)
         return "y"+ha+"m"+ha if ends_with_vowel(prev) else "m"+ha
@@ -433,20 +450,28 @@ def realize_single_morph(
     if tag=="PASSIVE":
         return "n" if ends_with_vowel(prev) or lower_tr(prev).endswith("l") \
                else choose_harmony_I(prev)+"l"
-    if tag=="CAUSATIVE":  return choose_initial_D(prev)+choose_harmony_I(prev)+"r"
+    if tag=="CAUSATIVE":
+        return "t" if ends_with_vowel(prev) else choose_initial_D(prev)+choose_harmony_I(prev)+"r"
     if tag=="RECIPROCAL": return choose_harmony_I(prev)+"ş"
     if tag=="REFLEXIVE":  return choose_harmony_I(prev)+"n"
     if tag in {"PART","CONV"}: return ""
+    if tag=="PAST_PART":   return "d"+choose_harmony_I(prev)+"k"  # softened in fuse step
     if tag=="CONV_AFTER":  return choose_harmony_U(prev)+"p"
     if tag=="CONV_BY":
         return ("y" if ends_with_vowel(prev) else "")+choose_harmony_A(prev)+"r"+choose_harmony_A(prev)+"k"
+    if tag=="CONV_WHILE":    return "ken"
+    if tag=="CONV_ASLONGAS":
+        return choose_initial_D(prev)+choose_harmony_I(prev)+"kç"+choose_harmony_A(prev)
     if tag=="INF1": return "m"+choose_harmony_A(prev)+"k"
     if tag=="INF2": return "m"+choose_harmony_A(prev)
     if tag=="NOM_DER_LIK": return "l"+choose_harmony_I(prev)+"k"
     if tag=="NOM_DER_LI":  return "l"+choose_harmony_I(prev)
     if tag=="NOM_DER_SIZ": return "s"+choose_harmony_I(prev)+"z"
     if tag=="NOM_DER_SEL": return "s"+choose_harmony_A(prev)+"l"
-    if tag=="NOM_DER_CI":  return choose_initial_C(prev)+choose_harmony_I(prev)
+    if tag=="NOM_DER_CI":
+        if lower_tr(prev).endswith(("t","d")):
+            hi=choose_harmony_I(prev); return hi+"c"+hi
+        return choose_initial_C(prev)+choose_harmony_I(prev)
     if tag=="NOM_DER_DAS": return choose_initial_D(prev)+choose_harmony_A(prev)+"ş"
     if tag=="NOM_DER_MSI": return choose_harmony_I(prev)+"ms"+choose_harmony_I(prev)
     realized=apply_vowel_harmony(underlying,prev)
@@ -462,7 +487,8 @@ def realize_allomorphs(root_surface:str, morphs:list[dict])->tuple[str,list[dict
         if piece is None: continue
         if not realized and starts_with_vowel(piece):
             current_root=apply_vowel_drop(current_root,piece)
-            if tag not in {"FUTURE","FUT_PART","CONV_AFTER","ABLE"}:
+            # Extended exemption list from notebook
+            if tag not in {"PASSIVE","FUTURE","FUT_PART","CONV_AFTER","ABLE","OPT","AOR"}:
                 current_root=apply_consonant_softening(current_root,piece)
             prev=current_root+"".join(p["surface"] for p in realized)
             piece=realize_single_morph(prev,morph,next_tag,copula_mode,has_possessive)
@@ -471,10 +497,9 @@ def realize_allomorphs(root_surface:str, morphs:list[dict])->tuple[str,list[dict
         if tag in POSSESSIVE_TAGS: has_possessive=True
     return current_root, fuse_realized_morphs(realized)
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # §6  OTTOMAN RENDER LAYER
-# ============================================================
-
+# ══════════════════════════════════════════════════════════════════════════════
 def render_ottoman(surface:str, historical:bool=False)->str:
     if not surface: return ""
     normalized=normalize_surface_ascii(surface)
@@ -495,8 +520,15 @@ def render_ottoman(surface:str, historical:bool=False)->str:
     return result
 
 def render_suffix_ottoman(tag:str, surface:str, historical:bool=True)->str:
-    """Render suffix, bypassing historical overrides for CAUSATIVE dır/tır forms."""
+    """Render a realized suffix, with tag-specific overrides."""
     normalized=normalize_surface_ascii(surface)
+    # FUTURE yecek/yeceğ: use ە not ه
+    if tag in {"FUTURE","FUT_PART"} and normalized in {"yecek","yeceğ"}:
+        return {"yecek":"یەجك","yeceğ":"یەجگ"}[normalized]
+    # PAST_PART diğ/tiğ: unified form
+    if tag=="PAST_PART" and normalized in {"diğ","tiğ"}:
+        return "دیگ"
+    # CAUSATIVE dır/tır: bypass historical overrides
     if tag=="CAUSATIVE" and normalized in {"dır","dir","dur","dür","tır","tir","tur","tür"}:
         return render_ottoman(surface,historical=False)
     return render_ottoman(surface,historical=historical)
@@ -506,49 +538,92 @@ def merge_ottoman(root_ot:str, suffixes:list[dict])->str:
     vtags=[p["tag"] for p in suffixes if p["ottoman"]]
     first=rendered[0] if rendered else ""
     if first.startswith("لر") and root_ot.endswith("ه"): root_ot=root_ot[:-1]+"ە"
-    if vtags[:1]==["REL_LOC"] and root_ot.endswith("ه"):  root_ot=root_ot[:-1]+"ە"
+    if first.startswith("لر") and len(rendered)>=2 and rendered[1]=="ه": rendered[1]="ە"
+    if vtags[:1]==["REL_LOC"] and root_ot.endswith("ه"): root_ot=root_ot[:-1]+"ە"
+    # P3SG + ACC
     if vtags[:2]==["P3SG","ACC"] and rendered[:2]==["سی","نی"]:
         if root_ot.endswith("ه"): root_ot=root_ot[:-1]+"ە"
         rendered=["سنی"]+rendered[2:]
+    elif vtags[:2]==["P3SG","ACC"] and rendered[:2]==["ی","نی"]:
+        rendered=["ینی"]+rendered[2:]
+    # P3SG + DAT
     if vtags[:2]==["P3SG","DAT"] and rendered[:2]==["ی","نه"]:
         rendered=["نە"]+rendered[2:]
+    # P3SG + LOC
+    if vtags[:2]==["P3SG","LOC"] and rendered[:2]==["ی","نده"]:
+        rendered=["نده"]+rendered[2:]
+    # P3SG + GEN
+    if vtags[:2]==["P3SG","GEN"] and rendered[:2]==["سی","نڭ"]:
+        rendered=["سنڭ"]+rendered[2:]
+    # P3SG + ABL
+    if vtags[:2]==["P3SG","ABL"] and rendered[:2]==["ی","ندن"]:
+        rendered=["ندن"]+rendered[2:]
+    # P2SG + ACC
     if vtags[:2]==["P2SG","ACC"] and rendered[:2]==["ن","نی"]:
         if root_ot.endswith("ه"): root_ot=root_ot[:-1]+"ە"
         rendered=["ڭی"]+rendered[2:]
+    # P1SG + ACC
     if vtags[:2]==["P1SG","ACC"] and rendered[:2]==["م","نی"]:
         rendered=["می"]+rendered[2:]
+    # PAST_PART combinations (scanned at any depth)
+    for idx in range(len(vtags)-2):
+        if vtags[idx:idx+3]==["PAST_PART","P2SG","LOC"] and rendered[idx+1:idx+3]==["ڭ","نده"]:
+            rendered=rendered[:idx+1]+["ندە"]+rendered[idx+3:]; break
+        if vtags[idx:idx+3]==["PAST_PART","P3SG","LOC"] and rendered[idx+1:idx+3]==["ی","نده"]:
+            rendered=rendered[:idx+1]+["ندە"]+rendered[idx+3:]; break
+        if vtags[idx:idx+3]==["PAST_PART","P3SG","ACC"] and rendered[idx+1:idx+3] in (["ی","نی"],["ینی"]):
+            rendered=rendered[:idx+1]+["نی"]+rendered[idx+3 if rendered[idx+1:idx+3]==["ی","نی"] else idx+2:]; break
+        if vtags[idx:idx+3]==["PAST_PART","P3SG","ABL"] and rendered[idx+1:idx+3]==["ی","ندن"]:
+            rendered=rendered[:idx+1]+["ندن"]+rendered[idx+3:]; break
+        if vtags[idx:idx+3]==["PAST_PART","P3SG","GEN"] and rendered[idx+1:idx+3]==["سی","نڭ"]:
+            rendered=rendered[:idx+1]+["سنڭ"]+rendered[idx+3:]; break
+    # CAUSATIVE + PROG
+    if vtags[:2]==["CAUSATIVE","PROG"] and rendered[:2] in (["ت","یور"],["ط","یور"]):
+        rendered=["تییور"]+rendered[2:]
     if first.startswith("ی") and root_ot.endswith("ه"): root_ot=root_ot[:-1]+"ە"
     return root_ot+"".join(rendered)
 
-def adjust_etmek_auxiliary_output(
-    lemma:Optional[str], realized_root:str, rendered_suffixes:list[dict],
-)->tuple[Optional[str],list[dict]]:
-    if lower_tr(lemma or "")!="etmek": return None,rendered_suffixes
-    if normalize_surface_ascii(realized_root)!="ed" or not rendered_suffixes: return None,rendered_suffixes
-    adjusted=[dict(p) for p in rendered_suffixes]
+def adjust_etmek_auxiliary_output(lemma:Optional[str], realized_root:str, rendered_sfx:list[dict])->tuple[Optional[str],list[dict]]:
+    if lower_tr(lemma or "")!="etmek": return None,rendered_sfx
+    if normalize_surface_ascii(realized_root)!="ed" or not rendered_sfx: return None,rendered_sfx
+    adjusted=[dict(p) for p in rendered_sfx]
     fs=normalize_surface_ascii(adjusted[0].get("surface",""))
     if not starts_with_vowel(fs): return None,adjusted
-    aux=("ایدی" if fs.startswith(("iyor","ıyor","uyor","üyor")) else "اید")
+    aux="ایدی" if fs.startswith(("iyor","ıyor","uyor","üyor")) else "اید"
     fo=adjusted[0].get("ottoman","")
     if fo.startswith("ه"): adjusted[0]["ottoman"]="ە"+fo[1:]
     return aux,adjusted
 
-def adjust_past_person_rendering(rendered_suffixes:list[dict])->list[dict]:
-    adjusted=[dict(p) for p in rendered_suffixes]
+def adjust_past_person_rendering(rendered_sfx:list[dict])->list[dict]:
+    adjusted=[dict(p) for p in rendered_sfx]
     for i in range(1,len(adjusted)):
         prev,item=adjusted[i-1],adjusted[i]
         if prev.get("tag")!="PAST": continue
         if item.get("tag") not in {"A1SG","A2SG","A1PL","A2PL"}: continue
-        prev["ottoman"]="ید" if normalize_surface_ascii(prev.get("surface","")).startswith("yd") else "د"
-        if item.get("tag")=="A2SG": item["ottoman"]="ڭ"
+        ps=normalize_surface_ascii(prev.get("surface",""))
+        syd=ps.startswith("yd")
+        prev["ottoman"]="ید" if syd else "د"
+        if item.get("tag")=="A2SG":  item["ottoman"]="ڭ"
+        elif item.get("tag")=="A1PL": item["ottoman"]="ق" if syd else "ك"
+        elif item.get("tag")=="A2PL": prev["ottoman"]="یدی" if syd else "دی"; item["ottoman"]="ڭز"
     return adjusted
 
-# ============================================================
+def adjust_softened_nominal_root_ottoman(root_ot:str, lemma:str, realized_root:str)->str:
+    base=normalize_surface_ascii(lemma or ""); realized=normalize_surface_ascii(realized_root or "")
+    if not base or not realized or len(base)!=len(realized) or base[:-1]!=realized[:-1]: return root_ot
+    pair=(base[-1],realized[-1])
+    if pair==("p","b") and root_ot.endswith("پ"): return root_ot[:-1]+"ب"
+    if pair==("ç","c") and root_ot.endswith("چ"):  return root_ot[:-1]+"ج"
+    if pair==("t","d") and root_ot.endswith(("ت","ط")): return root_ot[:-1]+"د"
+    if pair==("k","ğ"):
+        if root_ot.endswith("ق"): return root_ot[:-1]+"غ"
+        if root_ot.endswith(("ک","ك")): return root_ot[:-1]+"گ"
+    return root_ot
+
+# ══════════════════════════════════════════════════════════════════════════════
 # §7  ENGLISH TRANSLITERATION
-# ============================================================
-
+# ══════════════════════════════════════════════════════════════════════════════
 _ENG_VOWELS=set("aeiou")
-
 _ENG_PATTERNS:list[tuple[str,str]]=[
     ("tion","شن"),("sion","شن"),("ture","چر"),("ough","و"),("augh","اف"),("ight","ایت"),
     ("tch","چ"),("dge","ج"),("sch","ش"),("ght","ت"),("gue","گ"),("que","ک"),
@@ -577,7 +652,6 @@ ENGLISH_WORD_OVERRIDES:dict[str,str]={
     "english":"انگیلیزچه","french":"فرانسزچه","german":"الماندجه",
     "america":"امریقا","europe":"اوروپا","asia":"آسیا","africa":"افریقا",
 }
-
 def is_likely_english(word:str)->bool:
     w=word.lower()
     if any(c in w for c in "ğüşıöç"): return False
@@ -587,7 +661,6 @@ def is_likely_english(word:str)->bool:
                 "ence","able","ible","ity","ify","ize","ise","ism","ist","ish","ward"):
         if w.endswith(sfx) and len(w)>len(sfx)+1: return True
     return False
-
 def render_english_ottoman(word:str)->str:
     wl=word.lower()
     if wl in ENGLISH_WORD_OVERRIDES: return ENGLISH_WORD_OVERRIDES[wl]
@@ -597,8 +670,8 @@ def render_english_ottoman(word:str)->str:
         for pattern,ottoman in _ENG_PATTERNS:
             pl=len(pattern)
             if i+pl<=n and s[i:i+pl]==pattern:
-                if pattern=="gh" and i==0:       ottoman="غ"
-                elif pattern=="mb" and i+pl<n:   ottoman="مب"
+                if pattern=="gh" and i==0:        ottoman="غ"
+                elif pattern=="mb" and i+pl<n:    ottoman="مب"
                 elif pattern=="ou" and i+pl<n and s[i+pl] in "lr": ottoman="ور"
                 out+=ottoman; i+=pl; matched=True; break
         if matched: continue
@@ -613,16 +686,16 @@ def render_english_ottoman(word:str)->str:
     if out and out[0] in {"ه","ی","و"}: out="ا"+out
     return out
 
-# ============================================================
-# §8  ZEYREK TAG MAP + APOSTROPHE SUFFIXES
-# ============================================================
-
+# ══════════════════════════════════════════════════════════════════════════════
+# §8  ZEYREK TAG MAP + SURFACE FALLBACKS
+# ══════════════════════════════════════════════════════════════════════════════
 ZEYREK_TAG_MAP:dict[str,str]={
     "Passive":"PASSIVE","Pass":"PASSIVE","Caus":"CAUSATIVE",
     "Recip":"RECIPROCAL","Reflex":"REFLEXIVE",
     "Able":"ABLE","Unable":"UNABLE","Acquire":"ACQUIRE","Neg":"NEG",
-    "Inf1":"INF1","Inf2":"INF2","Part":"PART","FutPart":"FUT_PART",
-    "Conv":"CONV","AfterDoingSo":"CONV_AFTER","ByDoingSo":"CONV_BY","SinceDoingSo":"CONV_SINCE",
+    "Inf1":"INF1","Inf2":"INF2","Part":"PART","PastPart":"PAST_PART","FutPart":"FUT_PART",
+    "Conv":"CONV","AfterDoingSo":"CONV_AFTER","ByDoingSo":"CONV_BY",
+    "SinceDoingSo":"CONV_SINCE","AsLongAs":"CONV_ASLONGAS","While":"CONV_WHILE",
     "Past":"PAST","Narr":"NARR","Prog1":"PROG","Prog2":"PROG2",
     "Fut":"FUTURE","Aor":"AOR","Cond":"COND","Desr":"COND","Neces":"NECES","Opt":"OPT",
     "Cop":"COPULA_ASSERT",
@@ -649,26 +722,34 @@ _APOSTROPHE_SUFFIXES:set[str]={
     "lardan","lerden","larla","lerle","larda","lerde",
 }
 
-# ============================================================
-# §9  TRANSLITERATOR CLASS
-# ============================================================
+# Surface-only fallback for verb + frozen suffix combos
+SURFACE_VERB_FALLBACK_SUFFIXES:dict[str,str]={
+    "irken":"یركن","rken":"ركن",
+    "sınız":"سینز","siniz":"سینز","sunuz":"سینز","sünüz":"سینز",
+}
+SURFACE_FUTURE_CHAIN_SUFFIXES:dict[str,str]={
+    "tim":"دم","tin":"دڭ","ti":"دی","tık":"دق","tik":"دك","tuk":"دق","tük":"دك",
+    "tiniz":"دیڭز","tiler":"دیلر","lar":"لر","ler":"لر",
+    "mış":"مش","miş":"مش","muş":"مش","müş":"مش",
+}
 
+# ══════════════════════════════════════════════════════════════════════════════
+# §9  TRANSLITERATOR CLASS
+# ══════════════════════════════════════════════════════════════════════════════
 class OttomanTransliterator:
     """Thread-safe Ottoman transliteration engine. Instantiate once at startup."""
 
     def __init__(self, lookup_file:str="manual_lookup.tsv",
                  abbrev_file:str="abbrev_lookup.tsv", historical:bool=True)->None:
         self.historical=historical
-        self._lookup=self._load_tsv(lookup_file)
-        self._abbrev=self._load_tsv(abbrev_file)
+        self._lookup=self._load_tsv(lookup_file); self._abbrev=self._load_tsv(abbrev_file)
         self._lookup_folded:dict[str,str]={}
         for k,v in self._lookup.items():
             f=fold_tr(k)
             if f and f not in self._lookup_folded: self._lookup_folded[f]=v
-        _get_module_analyzer()  # warm up
+        _get_module_analyzer()
 
     # ── public ────────────────────────────────────────────────────────────
-
     def transliterate(self, text:str)->"TransliterationResult":
         tokens:list[dict]=[]; ot_parts:list[str]=[]; sources:list[str]=[]
         for tok,ot,src,dbg in self._tokenize(text):
@@ -682,7 +763,6 @@ class OttomanTransliterator:
         return TransliterationResult(turkish=text,ottoman=ottoman,confidence=confidence,tokens=tokens)
 
     # ── tokenization ──────────────────────────────────────────────────────
-
     def _tokenize(self, line:str):
         cursor=0
         for match in _TOKEN_RE.finditer(line):
@@ -693,8 +773,7 @@ class OttomanTransliterator:
             if not is_word_token(token):
                 yield token,convert_ottoman_punctuation(token),"punct",token
             else:
-                ot,src,dbg=self._transliterate_token(token)
-                yield token,ot,src,dbg
+                ot,src,dbg=self._transliterate_token(token); yield token,ot,src,dbg
             cursor=end
         if cursor<len(line):
             tail=line[cursor:]; yield tail,tail,"whitespace",tail
@@ -704,6 +783,7 @@ class OttomanTransliterator:
         lw=lower_tr(token)
         if lw in WORD_OVERRIDES: return WORD_OVERRIDES[lw],"override",token
 
+        # Apostrophe split
         norm=token.replace("\u2019","'").replace("\u2018","'")
         if "'" in norm:
             base,suffix=norm.split("'",1)
@@ -712,46 +792,51 @@ class OttomanTransliterator:
                 suf_ot=OTTOMAN_SURFACE_OVERRIDES.get(lower_tr(suffix)) or \
                        render_ottoman(lower_tr(suffix),self.historical)
                 return found[0]+suf_ot,"override",token
+            # Numeric apostrophe
+            if base.isdigit() or (base and all(c.isdigit() or c in ".,%" for c in base)):
+                suf_ot=self._render_numeric_apostrophe_suffix(lower_tr(suffix))
+                return base+suf_ot,"override",token
 
+        # Dictionary / number
         direct,src,form=self._lookup_word(token)
         if direct is not None: return direct,src,form
 
+        # English
         if is_likely_english(token): return render_english_ottoman(token),"english",token
 
+        # Zeyrek analysis
         analysis_word=token.replace("'","").replace("\u2019","")
         selected=self._select_parse(analysis_word)
         if selected:
             imp=self._generate_imperative(selected,analysis_word)
-            if imp: return imp["result"],"tags",f"{selected['lemma']} :: IMP :: {analysis_word}"
-
+            if imp: return imp["result"],"tags",f"{selected['lemma']} :: IMP"
             pp=self._generate_present_participle(selected,analysis_word)
-            if pp: return pp["result"],"tags",f"{selected['lemma']} :: PRES_PART :: {analysis_word}"
-
+            if pp: return pp["result"],"tags",f"{selected['lemma']} :: PRES_PART"
             pc=self._generate_participle_copula(selected,analysis_word)
-            if pc: return pc["result"],"tags",f"{selected['lemma']} :: PART_COP :: {analysis_word}"
-
+            if pc: return pc["result"],"tags",f"{selected['lemma']} :: PART_COP"
             pred=self._generate_predicative_inf(selected,analysis_word)
-            if pred: return pred["result"],"tags",f"{selected['lemma']} :: PRED_INF :: {analysis_word}"
-
+            if pred: return pred["result"],"tags",f"{selected['lemma']} :: PRED_INF"
             gen=self._generate(selected["root_ot"],selected["tags"],
                                selected["surface_root"],lemma=selected.get("lemma"))
             if gen:
                 sfx=" + ".join(p["surface"] for p in gen["suffixes"])
-                dbg=(f"{selected['lemma']} :: {'+'.join(selected['tags'])} :: "
-                     f"{selected['surface_root']}+{sfx}")
-                return gen["result"],"tags",dbg
+                return gen["result"],"tags",f"{selected['lemma']} :: {'+'.join(selected['tags'])} :: {selected['surface_root']}+{sfx}"
 
+        # Surface verb fallback
+        sfb=self._generate_surface_verb_fallback(token)
+        if sfb: return sfb[0],"surface",f"surface_verb:{sfb[1]}+{sfb[2]}"
+        sfc=self._generate_surface_future_chain_fallback(token)
+        if sfc: return sfc[0],"surface",f"surface_future:{sfc[1]}+{sfc[2]}"
+
+        # Auto fallback (no brackets)
         parses=self._flatten(analysis_word)
         if parses:
             pos=str(getattr(parses[0],"pos",""))
             if not any(x in pos for x in ("Prop","Abbrv","Unk")):
                 return render_ottoman(token,False),"auto",token
-
-        # Son çare: morfolojik analiz başarısız → render_ottoman ile otomatik çeviri
-        return render_ottoman(token, historical=False), "auto", token
+        return render_ottoman(token,False),"auto",token
 
     # ── dictionary helpers ────────────────────────────────────────────────
-
     @staticmethod
     def _load_tsv(filepath:str)->dict[str,str]:
         data:dict[str,str]={}
@@ -779,13 +864,28 @@ class OttomanTransliterator:
             return word.translate(str.maketrans("0123456789","٠١٢٣٤٥٦٧٨٩")),"exact",word
         if word in self._lookup: return self._lookup[word],"exact",word
         lw=lower_tr(word)
-        if lw in self._lookup:   return self._lookup[lw],"exact",lw
+        if lw in self._lookup: return self._lookup[lw],"exact",lw
         f=fold_tr(word)
         if f in self._lookup_folded: return self._lookup_folded[f],"exact",lw
         return None,None,None
 
-    # ── Zeyrek ───────────────────────────────────────────────────────────
+    def _render_numeric_apostrophe_suffix(self, suffix:str)->str:
+        overrides={
+            "da":"دە","de":"دە","ta":"دە","te":"دە","a":"ە","e":"ە",
+            "ı":"ی","i":"ی","u":"ی","ü":"ی",
+            "sı":"سی","si":"سی","su":"سی","sü":"سی",
+            "nı":"نی","ni":"نی","nu":"نی","nü":"نی",
+            "ını":"نی","ini":"نی","unu":"نی","ünü":"نی",
+            "sını":"سنی","sini":"سنی","sunu":"سنی","sünü":"سنی",
+            "ına":"نه","ine":"نه","una":"نه","üne":"نه",
+            "sına":"سنه","sine":"سنه","suna":"سنه","süne":"سنه",
+            "ından":"ندن","inden":"ندن","undan":"ندن","ünden":"ندن",
+            "ıydı":"یدی","iydi":"یدی","uydu":"یدی","üydü":"یدی",
+        }
+        return overrides.get(suffix) or OTTOMAN_SURFACE_OVERRIDES.get(suffix) or \
+               render_ottoman(suffix,self.historical)
 
+    # ── Zeyrek ───────────────────────────────────────────────────────────
     def _analyze(self, word:str): return _cached_zeyrek_analyze(normalize_tr_text(word))
     def _flatten(self, word:str)->list: return [p for grp in self._analyze(word) for p in grp]
 
@@ -860,9 +960,20 @@ class OttomanTransliterator:
         sw=lower_tr(getattr(parse,"word","") or ""); morphemes=list(getattr(parse,"morphemes",[]) or [])
         if sw.endswith(("sa","se")): score+=6 if "COND" in ntags else -6
         if sw.endswith(("mış","miş","muş","müş")): score+=10 if "NARR" in ntags else -10
+        if ("Dim" in morphemes
+                and sw.endswith(("ceğiz","cağız","ceğim","cağım","ceksin","caksın","ceksiniz","caksınız"))):
+            score-=24
+        if ("Fut" in morphemes
+                and any(t in ntags for t in {"A1SG","A1PL","A2SG","A2PL"})
+                and sw.endswith(("ceğim","cağım","ceğiz","cağız","ceksin","caksın","ceksiniz","caksınız"))):
+            score+=18
         if "ByDoingSo" in morphemes: score+=32 if ri["base_pos"]=="VERB" else -32
         if "Recip" in morphemes and ri["surface_root"].endswith("ş"): score+=10
         if ntags[-2:]==["P3SG","DAT"] and sw.endswith(("ına","ine","una","üne")): score+=1
+        if ntags[-2:]==["P3SG","ACC"] and sw.endswith(("ını","ini","unu","ünü")): score+=1
+        if ntags[-2:]==["P3SG","ABL"] and sw.endswith(("ından","inden","undan","ünden")): score+=1
+        if ntags[-2:]==["P3SG","LOC"] and sw.endswith(("ında","inde","unda","ünde","nda","nde")): score+=1
+        if ntags[-2:]==["P3SG","GEN"] and sw.endswith(("ının","inin","unun","ünün")): score+=1
         if ri["dict_form"]==lower_tr(getattr(parse,"lemma","") or ""): score+=6
         return score
 
@@ -875,15 +986,17 @@ class OttomanTransliterator:
             for tag in tags[1:]:
                 if tag=="COPULA": seen_cop=True; continue
                 if tag in VOICE_TAGS or tag in {"NEG","PROG","FUTURE","AOR","OPT","ABLE","UNABLE",
-                                                 "CONV_AFTER","CONV_BY","CONV_SINCE"}: return False
+                                                 "CONV_AFTER","CONV_BY","CONV_SINCE","CONV_ASLONGAS","CONV_WHILE"}: return False
                 if tag in {"PAST","NARR","COND","NECES"} and not seen_cop: return False
                 if tag in EMPTY_TAGS: continue
                 if tag in PERSON_TAGS and not seen_cop and tag not in {"A3SG","A3PL"}: return False
         if root_pos=="VERB":
             nominalized=False
             for tag in tags[1:]:
-                if tag in {"INF1","INF2","PART","CONV","CONV_AFTER","CONV_BY","CONV_SINCE","FUT_PART"}:
+                if tag in {"INF1","INF2","PART","PAST_PART","CONV","CONV_AFTER","CONV_BY",
+                           "CONV_SINCE","CONV_ASLONGAS","CONV_WHILE","FUT_PART"}:
                     nominalized=True; continue
+                if tag in NOMINAL_DERIVATION_TAGS: nominalized=True; continue
                 if (tag in POSSESSIVE_TAGS|CASE_TAGS|{"PLURAL"}
                         and not nominalized and "COPULA" not in tags and tag!="A3PL"):
                     return False
@@ -911,10 +1024,12 @@ class OttomanTransliterator:
                 "surface_root":ri["surface_root"],"tags":tags}
 
     # ── generation ────────────────────────────────────────────────────────
-
     def _generate(self, root_ot:str, tags:list[str], root_surface:str, lemma:Optional[str]=None):
         ntags=fuse_tag_strings(tags)
         if not self._validate_tags(ntags): return None
+        # Bare imperative: VERB + A2SG → just the stripped root
+        if ntags==["VERB","A2SG"]:
+            return {"surface_root":root_surface,"suffixes":[],"result":strip_infinitive_from_ottoman(root_ot)}
         morphs=build_underlying_morphs(ntags)
         realized_root,realized_sfx=realize_allomorphs(root_surface,morphs)
         rendered_sfx=[
@@ -925,20 +1040,25 @@ class OttomanTransliterator:
         rendered_sfx=adjust_past_person_rendering(rendered_sfx)
         if ntags and ntags[0]=="VERB" and rendered_sfx:
             stripped=strip_infinitive_from_ottoman(root_ot)
-            if normalize_surface_ascii(realized_root)==normalize_surface_ascii(root_surface):
+            if lower_tr(lemma or "")=="belirtmek":
+                stripped=strip_infinitive_from_ottoman("بلیرتمك")
+            if rendered_sfx[0].get("tag") in NOMINAL_DERIVATION_TAGS:
+                root_ot=stripped
+            elif normalize_surface_ascii(realized_root)==normalize_surface_ascii(root_surface):
                 root_ot=stripped
             else:
                 alt=WORD_OVERRIDES.get(realized_root) or render_ottoman(realized_root,self.historical)
                 root_ot=alt if alt!=stripped else stripped
             aux_root_ot,rendered_sfx=adjust_etmek_auxiliary_output(lemma,realized_root,rendered_sfx)
-            if aux_root_ot:
-                root_ot=aux_root_ot
-            elif (rendered_sfx
-                  and rendered_sfx[0].get("tag")=="PASSIVE"
-                  and normalize_surface_ascii(rendered_sfx[0].get("surface",""))=="n"
-                  and normalize_surface_ascii(realized_root).endswith(("la","le"))
-                  and root_ot.endswith(("ه","ە"))):
+            if aux_root_ot: root_ot=aux_root_ot
+            elif (rendered_sfx and rendered_sfx[0].get("tag")=="PASSIVE"
+                    and normalize_surface_ascii(rendered_sfx[0].get("surface",""))=="n"
+                    and normalize_surface_ascii(realized_root).endswith(("la","le"))
+                    and root_ot.endswith(("ه","ە"))):
                 root_ot=root_ot[:-1]
+        elif (ntags and ntags[0] in {"NOUN","ADJ","PRON","NUM"} and rendered_sfx and lemma
+                and normalize_surface_ascii(realized_root)!=normalize_surface_ascii(lemma)):
+            root_ot=adjust_softened_nominal_root_ottoman(root_ot,lemma,realized_root)
         return {"surface_root":realized_root,"suffixes":rendered_sfx,
                 "result":merge_ottoman(root_ot,rendered_sfx)}
 
@@ -971,15 +1091,14 @@ class OttomanTransliterator:
     def _generate_present_participle(self, sel:dict, word:str):
         morphemes=list(getattr(sel["parse"],"morphemes",[]) or [])
         if "PresPart" not in morphemes or "Cop" in morphemes: return None
-        base=self._generate(sel["root_ot"],sel["tags"],sel["surface_root"],lemma=sel.get("lemma"))
-        if not base: return None
         w=lower_tr(word or "")
-        base_surface=base["surface_root"]+"".join(p["surface"] for p in base["suffixes"])
-        if not w.startswith(base_surface): return None
-        part_surface=w[len(base_surface):]
+        root_surface=sel.get("surface_root") or lower_tr(sel.get("lemma") or "")
+        if not w.startswith(root_surface): return None
+        part_surface=w[len(root_surface):]
         if not part_surface: return None
+        root_ot=strip_infinitive_from_ottoman(sel["root_ot"])
         part_ot=OTTOMAN_SURFACE_OVERRIDES.get(part_surface) or render_ottoman(part_surface,self.historical)
-        return {"result":base["result"]+part_ot}
+        return {"result":root_ot+part_ot}
 
     def _generate_imperative(self, sel:dict, word:str):
         morphemes=list(getattr(sel["parse"],"morphemes",[]) or [])
@@ -990,20 +1109,51 @@ class OttomanTransliterator:
         suffix_surface=w[len(root_surface):]
         if not suffix_surface: return None
         root_ot=strip_infinitive_from_ottoman(sel["root_ot"])
-        suffix_ot=OTTOMAN_SURFACE_OVERRIDES.get(suffix_surface) or render_ottoman(suffix_surface,self.historical)
+        # Imperative-specific overrides (different from regular sın/siniz)
+        imp_overrides={
+            "sın":"سین","sin":"سین","sun":"سین","sün":"سین",
+            "sınız":"سینز","siniz":"سینز","sunuz":"سینز","sünüz":"سینز",
+            "sınlar":"سینلر","sinler":"سینلر","sunlar":"سینلر","sünler":"سینلر",
+        }
+        suffix_ot=imp_overrides.get(suffix_surface) or \
+                  OTTOMAN_SURFACE_OVERRIDES.get(suffix_surface) or \
+                  render_ottoman(suffix_surface,self.historical)
         return {"result":root_ot+suffix_ot}
 
-# ============================================================
-# §10  RESULT MODEL
-# ============================================================
+    def _generate_surface_verb_fallback(self, token:str):
+        word=lower_tr(token)
+        for suffix,suffix_ot in sorted(SURFACE_VERB_FALLBACK_SUFFIXES.items(),key=lambda x:-len(x[0])):
+            if not word.endswith(suffix) or len(word)<=len(suffix): continue
+            stem=word[:-len(suffix)]
+            root_entry=self._lookup_root_entry(stem)
+            sel=self._select_parse(stem)
+            if not root_entry and not sel: continue
+            if not any(self._parse_pos(p)=="VERB" for p in self._flatten(stem)): continue
+            root_ot=strip_infinitive_from_ottoman((root_entry[0] if root_entry else sel["root_ot"]))
+            return root_ot+suffix_ot, stem, suffix
+        return None
 
+    def _generate_surface_future_chain_fallback(self, token:str):
+        word=lower_tr(token)
+        future_bases=("acak","ecek","yacak","yecek")
+        for suffix,suffix_ot in sorted(SURFACE_FUTURE_CHAIN_SUFFIXES.items(),key=lambda x:-len(x[0])):
+            if not word.endswith(suffix) or len(word)<=len(suffix): continue
+            future_form=word[:-len(suffix)]
+            if not any(future_form.endswith(b) for b in future_bases): continue
+            future_ot,future_src,_=self._transliterate_token(future_form)
+            if future_src=="auto" and future_ot.startswith("["): continue
+            return future_ot+suffix_ot, future_form, suffix
+        return None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §10  RESULT MODEL
+# ══════════════════════════════════════════════════════════════════════════════
 @dataclass
 class TransliterationResult:
     turkish:    str
     ottoman:    str
     confidence: float
     tokens:     list[dict] = field(default_factory=list)
-
     def to_dict(self)->dict:
         return {"turkish":self.turkish,"ottoman":self.ottoman,
                 "confidence":self.confidence,"tokens":self.tokens}
