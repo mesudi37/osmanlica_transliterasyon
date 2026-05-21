@@ -23,6 +23,15 @@ def _simple_tokenize(text: str) -> list[str]:
     return [text.strip()] if text.strip() else []
 _zm._tokenize_text = _simple_tokenize
 logging.getLogger("zeyrek").setLevel(logging.ERROR)
+def normalize_ottoman_lookup_value(text: str) -> str:
+    """Normalise Ottoman script: unify glyph variants, strip thin spaces."""
+    if not text: return text
+    t = text.translate(str.maketrans({"ي": "ی", "ك": "ک"}))
+    t = re.sub(r"[\u2009\u200a\u200b\u202f]+", " ", t)
+    t = t.replace("جه", "جە").replace("چه", "چە")
+    return t
+
+
 
 # ── Module-level analyzer + LRU cache ────────────────────────────────────────
 _module_analyzer: Optional[zeyrek.MorphAnalyzer] = None
@@ -51,7 +60,7 @@ DUZ_UNLULER      = set("aeıi")
 _TUM_UNLULER     = KALIN_UNLULER | INCE_UNLULER
 
 PHONEME_MAP: dict[str, str] = {
-    "a":"ا","e":"ه","ı":"ی","i":"ی","o":"و","ö":"و","u":"و","ü":"و",
+    "a":"ا","e":"ە","ı":"ی","i":"ی","o":"و","ö":"و","u":"و","ü":"و",
     "b":"ب","c":"ج","ç":"چ","d":"د","f":"ف","g":"گ","ğ":"غ","h":"ه",
     "j":"ژ","l":"ل","m":"م","n":"ن","p":"پ","r":"ر","ş":"ش","v":"و",
     "y":"ی","z":"ز","k":"ک","q":"ق",
@@ -122,6 +131,7 @@ TAG_TO_STATE: dict[str,str] = {
     "NOM_DER_SIZ":DERIVATION_NOMINAL,"NOM_DER_SEL":DERIVATION_NOMINAL,
     "NOM_DER_CI":DERIVATION_NOMINAL,"NOM_DER_DAS":DERIVATION_NOMINAL,
     "NOM_DER_MSI":DERIVATION_NOMINAL,
+    "EQU":CASE_ST,
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -151,7 +161,7 @@ def choose_initial_D(s:str)->str:
 def choose_initial_C(s:str)->str:
     return "ç" if s and lower_tr(s[-1]) in {"ç","f","h","k","p","s","ş","t"} else "c"
 def strip_infinitive_from_ottoman(w:str)->str:
-    for sfx in ("مق","مك","ماق","مەك","mak","mek"):
+    for sfx in ("مق","مك","مک","ماق","ماک","مەك","مەک","mak","mek"):
         if w.endswith(sfx): return w[:-len(sfx)]
     return w
 def normalize_surface_ascii(t:str)->str:
@@ -174,6 +184,7 @@ UNDERLYING_MORPHS: dict[str,str] = {
     "REL":"ki","REL_LOC":"DAki","COPULA":"i","COPULA_ASSERT":"DIr",
     "NOM_DER_LIK":"lIk","NOM_DER_LI":"lI","NOM_DER_SIZ":"sIz",
     "NOM_DER_SEL":"sAl","NOM_DER_CI":"CI","NOM_DER_DAS":"DAş","NOM_DER_MSI":"ImsI",
+    "EQU":"cA",
 }
 
 OTTOMAN_SURFACE_OVERRIDES: dict[str,str] = {
@@ -181,7 +192,7 @@ OTTOMAN_SURFACE_OVERRIDES: dict[str,str] = {
     "lara":"لره","lere":"لره","lardan":"لردن","lerden":"لردن",
     "larla":"لرله","lerle":"لرله","larda":"لرده","lerde":"لرده",
     "ların":"لرڭ","lerin":"لرڭ",
-    "larını":"لرینی","lerini":"لرینی","larına":"لرینه","lerine":"لرینه",
+    "larını":"لرینی","lerini":"لرینی","larına":"لرینە","lerine":"لرینە",
     "larında":"لریندە","lerinde":"لریندە","larından":"لریندن","lerinden":"لریندن",
     "larının":"لرینڭ","lerinin":"لرینڭ",
     "ımız":"مز","imiz":"مز","umuz":"مز","ümüz":"مز",
@@ -216,7 +227,7 @@ OTTOMAN_SURFACE_OVERRIDES: dict[str,str] = {
     "yız":"یز","yiz":"یز","yuz":"یوز","yüz":"یوز",
     "r":"ر","ar":"ار","er":"ر",
     "sa":"سە","se":"سە","malı":"ملی","meli":"ملی",
-    "yor":"یور","ıyor":"یور","iyor":"یور","uyor":"یور","üyor":"یور",
+    "yor":"یور","ıyor":"ییور","iyor":"ییور","uyor":"ییور","üyor":"ییور",
     "makta":"مقدە","mekte":"مكدە",
     "abil":"ابیل","ebil":"ەبیل",
     "ıl":"یل","il":"یل","ul":"ول","ül":"ول",
@@ -237,7 +248,9 @@ OTTOMAN_SURFACE_OVERRIDES: dict[str,str] = {
     "yalı":"یالی","yeli":"یەلی",
     "me":"مە",
     # Optative / prohibitive
-    "yalım":"یالم","yelim":"یەلم","alım":"الم","elim":"الم",
+    "yalım":"یالم",
+    "ayım":"ایم",
+    "eyim":"ەیم","yelim":"یەلم","alım":"الم","elim":"الم",
     "mayın":"مایڭ","meyin":"مەیڭ",
     # Copula tense
     "iken":"ایکن","yken":"ایکن","ise":"ایسه","ysa":"ایسه","yse":"ایسه",
@@ -296,7 +309,40 @@ WORD_OVERRIDES: dict[str,str] = {
     "gidilen":"گیدیلن","gelince":"گلینجە",
     "adamak":"آدامق","adadı":"آدادی",
     "meslektaşlarımızı":"مسلكداشلریمزی",
+    "hayat":          "حیات",
+    "burhanettin":    "برهان الدّین",
+    "sultan":         "سلطان",
+    "ama":            "اما",
+    "rahmet":         "رحمت",
+    "başsağlığı":     "باشساغلغی",
+    "allah":          "اللّٰه",
+    "almanya":        "آلمانیە",
+    "antalya":        "آنطالیە",
+    "azerbaycan":     "آذربيجان",
+    "istanbul":       "استانبول",
+    "kütahya":        "كوتاهیە",
+    "erzincan":       "ارزنجان",
+    "gazze":          "غزّە",
+    "hollanda":       "هوللانده",
+    "israil":         "اسرائیل",
+    "lübnan":         "لبنان",
+    "medine":         "مدينه",
+    "mekke":          "مكه",
+    "mısır":          "مصر",
+    "pakistan":       "پاكستان",
+    "sapanca":        "صپانجە",
+    "tekne":          "تكنە",
+    "türkiye":        "توركیه",
+    "dile":           "دیلە",
+    "yakın":          "یاقین",
+    "ver":            "ویر",
+    "avrupa":         "آوروپە",
+    "savunurken":     "صاوونیركن",
+    "vurguluyor":     "وورغولییور",
+    "çöküş":          "چوكوش",
+    "çöküşten":       "چوكوشدن",
 }
+WORD_OVERRIDES = {k: normalize_ottoman_lookup_value(v) for k, v in WORD_OVERRIDES.items()}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # §5  MORPHOPHONEMIC RULES
@@ -375,6 +421,9 @@ def fuse_realized_morphs(seq:list[dict])->list[dict]:
             if prev["tag"]=="OPT" and item["tag"]=="A1PL":
                 prev["surface"]=prev["surface"]+"l"+choose_harmony_I(prev["surface"])+"m"
                 i+=1; continue
+            if prev["tag"]=="OPT" and item["tag"]=="A1SG":
+                prev["surface"]=prev["surface"]+"y"+choose_harmony_I(prev["surface"])+"m"
+                i+=1; continue
             if prev["tag"]=="UNABLE" and item["tag"]=="AOR":
                 item["surface"]="z"
             if prev["tag"]=="NEG" and item["tag"]=="AOR":
@@ -447,7 +496,9 @@ def realize_single_morph(
     if tag=="COND":   return "s"+choose_harmony_A(prev)
     if tag=="NECES":  return "m"+choose_harmony_A(prev)+"l"+choose_harmony_I(prev)
     if tag=="OPT":    return ("y" if ends_with_vowel(prev) else "")+choose_harmony_A(prev)
-    if tag=="NEG":    return "m"+choose_harmony_A(prev)
+    if tag=="NEG":
+        if next_tag=="PROG": return "m"
+        return "m"+choose_harmony_A(prev)
     if tag=="UNABLE":
         ha=choose_harmony_A(prev)
         return "y"+ha+"m"+ha if ends_with_vowel(prev) else "m"+ha
@@ -480,6 +531,7 @@ def realize_single_morph(
         return choose_initial_C(prev)+choose_harmony_I(prev)
     if tag=="NOM_DER_DAS": return choose_initial_D(prev)+choose_harmony_A(prev)+"ş"
     if tag=="NOM_DER_MSI": return choose_harmony_I(prev)+"ms"+choose_harmony_I(prev)
+    if tag=="EQU": return "c"+choose_harmony_A(prev)
     realized=apply_vowel_harmony(underlying,prev)
     return apply_buffer_consonants(prev,realized)
 
@@ -491,6 +543,8 @@ def realize_allomorphs(root_surface:str, morphs:list[dict])->tuple[str,list[dict
         prev=current_root+"".join(p["surface"] for p in realized)
         piece=realize_single_morph(prev,morph,next_tag,copula_mode,has_possessive)
         if piece is None: continue
+        if not realized and tag=="PROG" and current_root and current_root[-1] in "aeıioöuü":
+            current_root=current_root[:-1]
         if not realized and starts_with_vowel(piece):
             current_root=apply_vowel_drop(current_root,piece)
             # Extended exemption list from notebook
@@ -622,7 +676,9 @@ def adjust_softened_nominal_root_ottoman(root_ot:str, lemma:str, realized_root:s
     pair=(base[-1],realized[-1])
     if pair==("p","b") and root_ot.endswith("پ"): return root_ot[:-1]+"ب"
     if pair==("ç","c") and root_ot.endswith("چ"):  return root_ot[:-1]+"ج"
-    if pair==("t","d") and root_ot.endswith(("ت","ط")): return root_ot[:-1]+"د"
+    if pair==("t","d") and root_ot.endswith(("ت","ط")):
+        if root_ot.endswith("ات"): return root_ot
+        return root_ot[:-1]+"د"
     if pair==("k","ğ"):
         if root_ot.endswith("ق"): return root_ot[:-1]+"غ"
         if root_ot.endswith(("ک","ك")): return root_ot[:-1]+"گ"
@@ -663,7 +719,8 @@ ENGLISH_WORD_OVERRIDES:dict[str,str]={
 def is_likely_english(word:str)->bool:
     w=word.lower()
     if any(c in w for c in "ğüşıöç"): return False
-    if any(p in w for p in ("wh","ph","tch","tion","ght","ough","kn","wr")): return True
+    if any(p in w for p in ("wh","ph","tch","tion","ght","ough")): return True
+    if any(w.startswith(p) for p in ("kn","wr","gn","ps")): return True
     if "w" in w or "x" in w: return True
     for sfx in ("tion","sion","ness","ment","ful","less","ive","ous","ing","ance",
                 "ence","able","ible","ity","ify","ize","ise","ism","ist","ish","ward"):
@@ -712,6 +769,8 @@ ZEYREK_TAG_MAP:dict[str,str]={
     "Nom":"NOM","Acc":"ACC","Dat":"DAT","Loc":"LOC","Abl":"ABL","Gen":"GEN","Ins":"INS","Rel":"REL",
     "With":"NOM_DER_LI","Without":"NOM_DER_SIZ","Agt":"NOM_DER_CI",
     "Ness":"NOM_DER_LIK","FitFor":"NOM_DER_LIK",
+    "Related":"NOM_DER_SEL",
+    "Equ":"EQU","Ly":"EQU","AsIf":"EQU",
 }
 
 _APOSTROPHE_SUFFIXES:set[str]={
@@ -759,10 +818,10 @@ class OttomanTransliterator:
                  abbrev_file:str="abbrev_lookup.tsv", historical:bool=True)->None:
         self.historical=historical
         self._lookup=self._load_tsv(lookup_file); self._abbrev=self._load_tsv(abbrev_file)
-        self._lookup_folded:dict[str,str]={}
+        self._lookup_folded:dict[str,tuple]={}
         for k,v in self._lookup.items():
             f=fold_tr(k)
-            if f and f not in self._lookup_folded: self._lookup_folded[f]=v
+            if f and f not in self._lookup_folded: self._lookup_folded[f]=(k,v)
         _get_module_analyzer()
 
     # ── public ────────────────────────────────────────────────────────────
@@ -902,6 +961,7 @@ class OttomanTransliterator:
                 if len(row)>=2 and not row[0].startswith("#"):
                     k,v=row[0].strip(),row[1].strip()
                     if k.lower()=="word" and v.lower()=="ottoman": continue
+                    v=normalize_ottoman_lookup_value(v)
                     data[k]=v; data[lower_tr(k)]=v
         return data
 
@@ -912,7 +972,9 @@ class OttomanTransliterator:
         for cand,score in [(key,30),(lower_tr(key),24)]:
             if cand in self._lookup: return self._lookup[cand],cand,score
         f=fold_tr(key)
-        if f in self._lookup_folded: return self._lookup_folded[f],lower_tr(key),18
+        if f in self._lookup_folded:
+            mk,mv=self._lookup_folded[f]
+            return mv,lower_tr(mk),18
         return None
 
     def _lookup_word(self, word:str):
@@ -922,7 +984,9 @@ class OttomanTransliterator:
         lw=lower_tr(word)
         if lw in self._lookup: return self._lookup[lw],"exact",lw
         f=fold_tr(word)
-        if f in self._lookup_folded: return self._lookup_folded[f],"exact",lw
+        if f in self._lookup_folded:
+            _,fv=self._lookup_folded[f]
+            return fv,"exact",lw
         return None,None,None
 
     def _render_numeric_apostrophe_suffix(self, suffix:str)->str:
@@ -982,8 +1046,22 @@ class OttomanTransliterator:
             found=self._lookup_root_entry(cand)
             if found:
                 root_ot,dict_form,ls=found
+                # Skip folded VERB matches where the dict form doesn't match the candidate
+                if base_pos=="VERB" and ls<=18 and lower_tr(dict_form)!=lower_tr(cand):
+                    continue
                 return {"root_ot":root_ot,"lemma":lemma,"dict_form":dict_form,
                         "lookup_score":ls,"base_pos":base_pos,"surface_root":sr or lower_tr(cand)}
+        # Verb fallback: synthesise root from surface form when no dict entry found
+        if base_pos=="VERB" and sr:
+            root_ot=render_ottoman(sr,historical=self.historical)
+            return {"root_ot":root_ot,"lemma":lemma,"dict_form":lower_tr(lemma),
+                    "lookup_score":0,"base_pos":base_pos,"surface_root":sr}
+        # EQU/Ly/AsIf/Related fallback
+        morphemes=list(getattr(parse,"morphemes",[]) or [])
+        if any(m in morphemes for m in ("Equ","Ly","AsIf","Related")) and sr:
+            root_ot=render_ottoman(sr,historical=self.historical)
+            return {"root_ot":root_ot,"lemma":lemma,"dict_form":lower_tr(lemma),
+                    "lookup_score":0,"base_pos":base_pos,"surface_root":sr}
         return None
 
     def _zeyrek_tags(self, parse)->list[str]:
