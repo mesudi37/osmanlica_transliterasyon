@@ -26,7 +26,9 @@ logging.getLogger("zeyrek").setLevel(logging.ERROR)
 def normalize_ottoman_lookup_value(text: str) -> str:
     """Normalise Ottoman script: unify glyph variants, strip thin spaces."""
     if not text: return text
-    t = text.translate(str.maketrans({"ي": "ی", "ك": "ک"}))
+    t = text.replace("ي", "ی")
+    if len(t) > 1:
+        t = t[:-1].replace("ك", "ک") + t[-1]
     t = re.sub(r"[\u2009\u200a\u200b\u202f]+", " ", t)
     t = t.replace("جه", "جە").replace("چه", "چە")
     return t
@@ -240,7 +242,7 @@ OTTOMAN_SURFACE_OVERRIDES: dict[str,str] = {
     "ıcı":"یجی","ici":"یجی","ucu":"یجی","ücü":"یجی",
     "arak":"ارق","erek":"ارك",
     "lan":"لان","len":"لن",
-    "lık":"لق","lik":"لق","luk":"لق","lük":"لق",
+    "lık":"لك","lik":"لك","luk":"لك","lük":"لك",
     "yın":"ین","yin":"ین","yun":"یون","yün":"یون",
     "maz":"مز","mez":"مز",
     "maman":"مامن","memen":"مەمن",
@@ -304,7 +306,9 @@ WORD_OVERRIDES: dict[str,str] = {
     "zorla":"زورلا","paylaş":"پایلاش",
     "elektrik":"الكتریگ","üretecek":"أورتجك",
     "gelir":"گلیر","misin":"میسڭ",
-    "beraberliğe":"برابرلگە","istemişti":"ایستەمشدی",
+    "güven":          "گوگن",
+    "mürettebatlı":   "مرتّباتلی",
+    "istemişti":      "ایستەمشدی",
     "seyrediyorum":"سیر ایدییورم","izleyen":"ایزلەین",
     "gidilen":"گیدیلن","gelince":"گلینجە",
     "adamak":"آدامق","adadı":"آدادی",
@@ -573,7 +577,9 @@ def render_ottoman(surface:str, historical:bool=False)->str:
     for idx,ch in enumerate(normalized):
         if ch in _TUM_UNLULER: harmony="kalin" if ch in KALIN_UNLULER else "ince"
         if skip_first and idx==0: continue
-        if ch=="k":   result+="ق" if harmony=="kalin" else "ک"
+        if ch=="k":
+            if idx==len(normalized)-1: result+="ك"
+            else: result+="ق" if harmony=="kalin" else "ک"
         elif ch=="t": result+="ط" if harmony=="kalin" else "ت"
         elif ch=="s": result+="ص" if harmony=="kalin" else "س"
         else:         result+=PHONEME_MAP.get(ch,ch)
@@ -582,6 +588,7 @@ def render_ottoman(surface:str, historical:bool=False)->str:
 def render_suffix_ottoman(tag:str, surface:str, historical:bool=True)->str:
     """Render a realized suffix, with tag-specific overrides."""
     normalized=normalize_surface_ascii(surface)
+    if tag=="EQU": return "جە"
     # FUTURE yecek/yeceğ: use ە not ه
     if tag in {"FUTURE","FUT_PART"} and normalized in {"yecek","yeceğ"}:
         return {"yecek":"یەجك","yeceğ":"یەجگ"}[normalized]
@@ -800,6 +807,83 @@ SURFACE_FUTURE_CHAIN_SUFFIXES:dict[str,str]={
     "mış":"مش","miş":"مش","muş":"مش","müş":"مش",
 }
 
+
+# ── Apostrophe suffix renderer ────────────────────────────────────────────────
+def _render_apostrophe_suffix(suffix: str) -> str:
+    normalized = lower_tr(suffix)
+    if normalized in {"ya","ye"}: return "یە"
+    if normalized in {"da","de","ta","te"}: return "دە"
+    return OTTOMAN_SURFACE_OVERRIDES.get(normalized) or render_ottoman(normalized, historical=True)
+
+# ── Lexicalized nominal overrides ────────────────────────────────────────────
+LEXICALIZED_NOMINAL_STEM_OVERRIDES: dict[str,str] = {
+    "ameliyat":"عملیات", "hayat":"حیات", "kaybeden":"غائب ایدن",
+}
+LEXICALIZED_NOMINAL_SUFFIX_OVERRIDES: dict[str,str] = {
+    "ı":"ی","i":"ی","u":"ی","ü":"ی",
+    "ını":"نی","ini":"نی","unu":"نی","ünü":"نی",
+    "ının":"نڭ","inin":"نڭ","unun":"نڭ","ünün":"نڭ",
+    "ına":"نە","ine":"نە","una":"نە","üne":"نە",
+    "ından":"ندن","inden":"ندن","undan":"ندن","ünden":"ندن",
+    "lar":"لر","ler":"لر","lara":"لرە","lere":"لرە",
+}
+
+# ── LIK-drop surface overrides ───────────────────────────────────────────────
+LIK_DROP_STEM_OVERRIDES: dict[str,str] = {
+    "bilge":"بیلگە","hakim":"حاكم","lider":"لیدر","değişik":"دگیشیك",
+    "beraber":"برابر","bakan":"باقان","çöp":"چوپ","genç":"گنچ",
+    "müdür":"مدير","önder":"اوندهر","özgür":"اوزگور","sağ":"صاغ",
+}
+LIK_DROP_STEM_SUFFIX_OVERRIDES: dict[tuple,str] = {
+    ("hasta","lığı"):"خستەلقی",("hasta","lığında"):"خستەلقڭده",
+    ("hasta","lığına"):"خستەلقڭه",("hasta","lığından"):"خستەلقندن",
+    ("nite","liği"):"نیتهلیغی",("nite","liğinde"):"نیتهلیغینده",
+    ("nite","liğine"):"نیتهلیغینه",("nite","liğinden"):"نیتهلیغیندن",
+    ("nite","liğindeki"):"نیتهلیغیندهکی",
+    ("sağ","lığında"):"صاغلقڭده",("sağ","lığına"):"صاغلقڭه",
+    ("sağ","lığından"):"صاغلقندن",
+    ("savcı","lığından"):"صاوجیلغندن",
+    ("başsavcı","lığından"):"باشصاوجیلغندن",
+}
+LIK_DROP_SURFACE_OVERRIDES: dict[str,str] = {
+    "liği":"لگی","lığı":"لگی","luğu":"لگی","lüğü":"لگی",
+    "liğe":"لگە","lığa":"لگە","luğa":"لگە","lüğe":"لگە",
+    "liğinde":"لگینده","lığında":"لگینده","luğunda":"لگینده","lüğünde":"لگینده",
+    "liğine":"لگینه","lığına":"لگنە","luğuna":"لگنە","lüğüne":"لگنە",
+    "liğinden":"لگیندن","lığından":"لگیندن","luğundan":"لگیندن","lüğünden":"لگیندن",
+    "liğindeki":"لگیندهکی","lığındaki":"لگیندهکی","luğundaki":"لگیندهکی","lüğündeki":"لگیندهکی",
+}
+
+# ── Related-adjective overrides ──────────────────────────────────────────────
+RELATED_ADJ_STEM_OVERRIDES: dict[str,str] = {
+    "para":"پارە", "katılım":"قاتیلیم",
+}
+
+# ── Equative -ca/-ce normalizer ──────────────────────────────────────────────
+def normalize_ca_stem_ottoman(stem: str, stem_ottoman: str) -> str:
+    st = normalize_ottoman_lookup_value(stem_ottoman)
+    if st.startswith("اە"): st = "ا" + st[2:]
+    if stem.endswith(("ma","me")):
+        if st.endswith(("ما","مه","مق","مک")): st = st[:-1] + "ە"
+        if stem and stem[0] not in _TUM_UNLULER and len(st)>=2 and st[1]=="ە":
+            st = st[0] + st[2:]
+    if (stem.endswith(("an","en","ın","in","un","ün"))
+            and len(st)>=2 and st[-1]=="ن" and st[-2] in "اەیو"):
+        st = st[:-2] + "ن"
+    return st
+
+# ── Loanword post-processing ─────────────────────────────────────────────────
+def normalize_auto_loanword_surface(token: str, ottoman: str) -> str:
+    lw = lower_tr(token or "")
+    if lw.startswith("zayıf") and ottoman.startswith("زاییف"):
+        return "ضعیف" + ottoman[len("زاییف"):]
+    return ottoman
+
+def normalize_latin_terminal_s(token: str, ottoman: str) -> str:
+    if re.fullmatch(r"[A-Za-z]+", token or "") and lower_tr(token).endswith("s") and ottoman.endswith(("ش","ص")):
+        return ottoman[:-1] + "س"
+    return ottoman
+
 # ── Question particle suffix list (for concatenated-question recovery) ───────
 QUESTION_PARTICLE_SUFFIXES = (
     "mıyım","miyim","muyum","müyüm",
@@ -853,6 +937,58 @@ class OttomanTransliterator:
         if cursor<len(line):
             tail=line[cursor:]; yield tail,tail,"whitespace",tail
 
+    def _render_lexicalized_nominal_surface(self, token:str):
+        word=lower_tr(token)
+        for stem,stem_ot in sorted(LEXICALIZED_NOMINAL_STEM_OVERRIDES.items(),key=lambda x:-len(x[0])):
+            if not word.startswith(stem): continue
+            suffix=word[len(stem):]
+            if not suffix: return stem_ot,stem,""
+            suffix_ot=(LEXICALIZED_NOMINAL_SUFFIX_OVERRIDES.get(suffix) or
+                       OTTOMAN_SURFACE_OVERRIDES.get(suffix) or
+                       render_ottoman(suffix,self.historical))
+            return stem_ot+suffix_ot,stem,suffix
+        return None
+
+    def _render_lik_drop_surface(self, token:str):
+        word=lower_tr(token)
+        for suffix,suffix_ot in sorted(LIK_DROP_SURFACE_OVERRIDES.items(),key=lambda x:-len(x[0])):
+            if not word.endswith(suffix) or len(word)<=len(suffix): continue
+            stem=token[:-len(suffix)]; stem_lw=lower_tr(stem)
+            override=LIK_DROP_STEM_SUFFIX_OVERRIDES.get((stem_lw,suffix))
+            if override is not None: return override,stem,suffix
+            stem_ot=LIK_DROP_STEM_OVERRIDES.get(stem_lw)
+            if stem_ot is None:
+                r=self._transliterate_token(stem)
+                if r[1]=="missing": continue
+                stem_ot=r[0]
+            return stem_ot+suffix_ot,stem,suffix
+        return None
+
+    def _render_related_adj_surface(self, token:str):
+        word=lower_tr(token)
+        if not word.endswith(("sal","sel")) or len(word)<=3: return None
+        for parse in self._flatten(token):
+            if "Related" not in (list(getattr(parse,"morphemes",[]) or [])): continue
+            stem=token[:-3]; stem_lw=lower_tr(stem)
+            stem_ot=RELATED_ADJ_STEM_OVERRIDES.get(stem_lw)
+            if stem_ot is None:
+                found=self._lookup_root_entry(stem)
+                stem_ot=found[0] if found else render_ottoman(stem,self.historical)
+            return stem_ot+"سال",stem,word[-3:]
+        return None
+
+    def _render_ca_surface(self, token:str):
+        word=lower_tr(token)
+        for suffix in ("ça","çe","ca","ce"):
+            if not word.endswith(suffix) or len(word)<=len(suffix): continue
+            stem=token[:-len(suffix)]; stem_lw=lower_tr(stem)
+            if not stem_lw.endswith(("ma","me","n")): continue
+            found=self._lookup_word(stem)
+            stem_ot=found[0] if found[0] else render_ottoman(stem,self.historical)
+            stem_ot=normalize_ca_stem_ottoman(stem_lw,stem_ot)
+            if stem_ot: return stem_ot+"جە",stem,suffix
+        return None
+
     def _render_concatenated_question_particle(self, token:str):
         """Recover tokens where a question particle was written without a space."""
         word=lower_tr(token)
@@ -873,8 +1009,7 @@ class OttomanTransliterator:
             "sınız","siniz","sunuz","sünüz",
             "sınlar","sinler","sunlar","sünler",
         )
-
-        # 1. Hard override (case-sensitive then lowercased)
+        # 1. Hard override
         if token in WORD_OVERRIDES: return WORD_OVERRIDES[token],"override",token
         lw=lower_tr(token)
         if lw=="belirt": return "بلیرت","override",token
@@ -884,15 +1019,15 @@ class OttomanTransliterator:
         norm=token.replace("\u2019","'").replace("\u2018","'")
         if "'" in norm:
             base,suffix=norm.split("'",1)
-            # Numeric apostrophe (586'ya, 795'e …)
             if base.isdigit() and suffix:
                 base_ot=base.translate(str.maketrans("0123456789","٠١٢٣٤٥٦٧٨٩"))
                 return base_ot+self._render_numeric_apostrophe_suffix(suffix),"override",token
             found=self._lookup_root_entry(base) or self._lookup_root_entry(lower_tr(base))
             if found and lower_tr(suffix) in _APOSTROPHE_SUFFIXES:
-                suf_ot=OTTOMAN_SURFACE_OVERRIDES.get(lower_tr(suffix)) or \
-                       render_ottoman(lower_tr(suffix),self.historical)
-                return found[0]+suf_ot,"override",token
+                return found[0]+_render_apostrophe_suffix(lower_tr(suffix)),"override",token
+            if base and suffix and lower_tr(suffix) in _APOSTROPHE_SUFFIXES:
+                base_ot=render_ottoman(base,self.historical)
+                return base_ot+_render_apostrophe_suffix(lower_tr(suffix)),"surface",f"{base}+'{suffix}"
 
         # 2b. Inline numeral+suffix (7lik → ٧لك)
         num_match=re.fullmatch(rf"(\d+)([{_TR_WORD_CHARS}]+)",norm)
@@ -902,11 +1037,23 @@ class OttomanTransliterator:
                 base_ot=base_n.translate(str.maketrans("0123456789","٠١٢٣٤٥٦٧٨٩"))
                 return base_ot+self._render_numeric_apostrophe_suffix(sfx_lw),"override",token
 
-        # 2c. Concatenated question particle (gelirmisin → gelir+misin)
+        # 2c. Concatenated question particle
         cq=self._render_concatenated_question_particle(token)
         if cq: return cq[0],"surface",f"{cq[1]} + {cq[2]}"
 
-        # 3. Imperative-like surfaces: analyse BEFORE dictionary lookup
+        # 2d. Lexicalized nominal surface
+        lex=self._render_lexicalized_nominal_surface(token)
+        if lex: return lex[0],"surface",(f"{lex[1]} + {lex[2]}" if lex[2] else lex[1])
+
+        # 2e. LIK-drop surface
+        lik=self._render_lik_drop_surface(token)
+        if lik: return lik[0],"surface",f"{lik[1]} + {lik[2]}"
+
+        # 2f. Related-adjective surface
+        rel=self._render_related_adj_surface(token)
+        if rel: return rel[0],"surface",f"{rel[1]} + {rel[2]}"
+
+        # 3. Imperative-like surfaces before dict lookup
         selected=None
         if lw.endswith(imperative_like_suffixes):
             selected=self._select_parse(analysis_word)
@@ -922,15 +1069,26 @@ class OttomanTransliterator:
 
         # 5. Dictionary / number lookup
         direct,src,form=self._lookup_word(token)
-        if direct is not None: return direct,src,form
+        if direct is not None:
+            direct=normalize_latin_terminal_s(token,direct)
+            return direct,src,form
+
+        # 5b. CA-surface after dict to avoid false positives
+        ca=self._render_ca_surface(token)
+        if ca: return ca[0],"surface",f"{ca[1]} + {ca[2]}"
 
         # 6. English
-        if is_likely_english(token): return render_english_ottoman(token),"english",token
+        if is_likely_english(token):
+            eng_ot=render_english_ottoman(token)
+            eng_ot=normalize_latin_terminal_s(token,eng_ot)
+            return eng_ot,"english",token
 
         # 7. Zeyrek morphological analysis
         if selected is None:
             selected=self._select_parse(analysis_word)
         if selected:
+            imp=self._generate_imperative(selected,analysis_word)
+            if imp: return imp["result"],"tags",f"{selected['lemma']} :: IMP"
             pp=self._generate_present_participle(selected,analysis_word)
             if pp: return pp["result"],"tags",f"{selected['lemma']} :: PRES_PART"
             pc=self._generate_participle_copula(selected,analysis_word)
@@ -948,8 +1106,10 @@ class OttomanTransliterator:
         if parses:
             pos=str(getattr(parses[0],"pos",""))
             if not any(x in pos for x in ("Prop","Abbrv","Unk")):
-                return render_ottoman(token,False),"auto",token
-        return render_ottoman(token,False),"auto",token
+                auto_ot=render_ottoman(token,False)
+                return normalize_latin_terminal_s(token,normalize_auto_loanword_surface(token,auto_ot)),"auto",token
+        auto_ot=render_ottoman(token,False)
+        return normalize_latin_terminal_s(token,normalize_auto_loanword_surface(token,auto_ot)),"auto",token
 
     # ── dictionary helpers ────────────────────────────────────────────────
     @staticmethod
@@ -1197,6 +1357,10 @@ class OttomanTransliterator:
                     and normalize_surface_ascii(rendered_sfx[0].get("surface",""))=="n"
                     and normalize_surface_ascii(realized_root).endswith(("la","le"))
                     and root_ot.endswith(("ه","ە"))):
+                root_ot=root_ot[:-1]
+            elif (rendered_sfx
+                    and normalize_surface_ascii(rendered_sfx[0].get("surface","")) in {"yor","ıyor","iyor","uyor","üyor"}
+                    and root_ot.endswith(("لا","لە","له"))):
                 root_ot=root_ot[:-1]
         elif (ntags and ntags[0] in {"NOUN","ADJ","PRON","NUM"} and rendered_sfx and lemma
                 and normalize_surface_ascii(realized_root)!=normalize_surface_ascii(lemma)):
